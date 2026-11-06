@@ -1,0 +1,16 @@
+{
+  "name": "hungreens-absensi-bot",
+  "version": "1.0.0",
+  "description": "Bot Absensi WhatsApp Hungreens - Cloud 24 Jam",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
+    "express": "^4.19.2",
+    "pino": "^9.0.0",
+    "qrcode": "^1.5.3"
+  }
+}

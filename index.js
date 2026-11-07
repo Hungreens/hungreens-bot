@@ -64,7 +64,7 @@ app.get("/", (req, res) => {
           .badge-wait { background: #fef3c7; color: #b45309; }
           .btn { display: inline-block; padding: 8px 16px; background: #0284c7; color: white; text-decoration: none; border-radius: 8px; font-weight: 500; font-size: 13px; }
           .feature { background: #f1f5f9; padding: 14px 16px; border-radius: 10px; margin-top: 15px; font-size: 13px; line-height: 1.6; }
-          .log-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 250px; overflow-y: auto; margin-top: 15px; line-height: 1.5; }
+          .log-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 260px; overflow-y: auto; margin-top: 15px; line-height: 1.5; }
         </style>
       </head>
       <body>
@@ -153,17 +153,31 @@ app.listen(PORT, () => {
 // ===================================================================
 
 const groupNameCache = new Map();
+
+async function refreshAllGroupNames(sock) {
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    for (const [id, meta] of Object.entries(groups)) {
+      if (meta && meta.subject) {
+        groupNameCache.set(id, meta.subject.toLowerCase());
+      }
+    }
+    console.log(`Berhasil memuat ${groupNameCache.size} daftar nama grup WhatsApp.`);
+  } catch (e) {
+    console.error("Gagal refresh groupFetchAllParticipating:", e.message);
+  }
+}
+
 async function getGroupName(sock, jid) {
   if (groupNameCache.has(jid)) return groupNameCache.get(jid);
   try {
     const meta = await sock.groupMetadata(jid);
     if (meta && meta.subject) {
-      groupNameCache.set(jid, meta.subject);
-      return meta.subject;
+      const s = meta.subject.toLowerCase();
+      groupNameCache.set(jid, s);
+      return s;
     }
-  } catch (e) {
-    // Jangan cache jika gagal
-  }
+  } catch (e) {}
   return "";
 }
 
@@ -218,6 +232,8 @@ async function startWhatsAppBot() {
       isConnected = true;
       currentQRDataURL = null;
       addLog("KONEKSI", "✅ Berhasil terhubung ke WhatsApp Hungreens!");
+      // Pra-muat seluruh nama grup saat koneksi terbuka
+      await refreshAllGroupNames(sock);
     }
   });
 
@@ -244,6 +260,18 @@ async function startWhatsAppBot() {
         return;
       }
 
+      // Ambil nama grup
+      const groupName = await getGroupName(sock, msg.key.remoteJid);
+
+      const isAttendanceGroup = groupName && groupName.includes("absen");
+      const isExpenseGroup = groupName && (groupName.includes("pengeluaran") || groupName.includes("salad"));
+
+      // HANYA proses jika pesan berasal dari grup Absensi atau Pengeluaran Salad!
+      // Jika dari grup lain (STORY PEDIA, keluarga, teman, dll), langsung abaikan 100%!
+      if (!isAttendanceGroup && !isExpenseGroup) {
+        return;
+      }
+
       const senderJid = msg.key.participant || msg.key.remoteJid;
       const cleanPhone = senderJid.replace(/@.+/, "").replace(/\D/g, "");
       const pushName = msg.pushName || (msg.key.fromMe ? "Owner (Dimmy)" : "Karyawan");
@@ -252,20 +280,6 @@ async function startWhatsAppBot() {
       // Cek tipe pesan
       const isLocation = !!(content.locationMessage || content.liveLocationMessage);
       const hasImage = !!content.imageMessage;
-
-      // Cek nama grup secara aman
-      let groupName = "";
-      try {
-        groupName = (await getGroupName(sock, msg.key.remoteJid)).toLowerCase();
-      } catch (e) {}
-
-      // Jika nama grup terdeteksi dan BUKAN grup Hungreens (misal grup lain), abaikan!
-      if (groupName) {
-        const isHungreens = groupName.includes("absen") || groupName.includes("pengeluaran") || groupName.includes("salad") || groupName.includes("hungreens");
-        if (!isHungreens) {
-          return; // Abaikan grup luar
-        }
-      }
 
       // Waktu Pesan
       const timestampSeconds = msg.messageTimestamp;
@@ -277,16 +291,13 @@ async function startWhatsAppBot() {
 
       // Log pesan yang masuk langsung ke monitor
       const tipeMsg = isLocation ? "SHARELOC" : (hasImage ? "FOTO" : "TEKS");
-      addLog("CHAT MASUK", `Dari ${senderName} [${tipeMsg}]`);
+      addLog("CHAT MASUK", `Dari ${senderName} [${tipeMsg}] di grup [${groupName}]`);
 
       // ==============================================================
-      // MODUL 1: ABSENSI (HANYA UNTUK PESAN SHARELOC)
+      // MODUL 1: ABSENSI (HANYA AKTIF DI GRUP ABSENSI)
       // ==============================================================
-      if (isLocation) {
-        // Jika nama grup pengeluaran, jangan proses absen di sini
-        if (groupName && (groupName.includes("pengeluaran") || groupName.includes("salad"))) {
-          return;
-        }
+      if (isAttendanceGroup) {
+        if (!isLocation) return; // Grup absensi hanya menerima shareloc
 
         addLog("ABSENSI", `📍 Shareloc dari ${senderName} (${timeStr} WIB, tgl ${dateNum})`);
 
@@ -309,77 +320,74 @@ async function startWhatsAppBot() {
       }
 
       // ==============================================================
-      // MODUL 2: PENGELUARAN (FOTO NOTA / BUKTI TRANSFER / TEKS BIAYA)
+      // MODUL 2: PENGELUARAN (HANYA AKTIF DI GRUP PENGELUARAN SALAD)
       // ==============================================================
-      // Jika nama grup terdeteksi absen, jangan proses pengeluaran di sini
-      if (groupName && groupName.includes("absen")) {
-        return;
-      }
+      if (isExpenseGroup) {
+        let imageBase64 = null;
+        let imageMime = "image/jpeg";
 
-      let imageBase64 = null;
-      let imageMime = "image/jpeg";
-
-      if (hasImage) {
-        imageMime = (content.imageMessage.mimetype || "image/jpeg").split(";")[0].trim();
-        addLog("GAMBAR", `Mendownload foto dari ${senderName}...`);
-        try {
-          const unwrappedMsg = { key: msg.key, message: content };
-          const buffer = await downloadMediaMessage(unwrappedMsg, "buffer", {});
-          imageBase64 = buffer.toString("base64");
-          addLog("GAMBAR", `📸 Foto berhasil diunduh (${(buffer.length / 1024).toFixed(1)} KB)`);
-        } catch (e) {
-          addLog("ERROR GAMBAR", `Gagal download foto: ${e.message}`);
-        }
-      }
-
-      if (!text && !imageBase64) return;
-
-      if (text) {
-        addLog("TEKS", `"${text}" dari ${senderName}`);
-      }
-
-      // Analisis menggunakan AI / Smart Parser
-      const expense = await parseExpenseWithAI(text, imageBase64, imageMime, GEMINI_API_KEY);
-
-      if (expense && expense.isExpense) {
-        const formatRupiah = `Rp ${Number(expense.total).toLocaleString("id-ID")}`;
-        addLog("PENGELUARAN", `💸 Terdeteksi: ${expense.item} (${formatRupiah}) [${expense.category}]`);
-
-        if (!EXPENSE_WEBHOOK_URL || EXPENSE_WEBHOOK_URL.includes("docs.google.com")) {
-          addLog("PERINGATAN", "EXPENSE_WEBHOOK_URL belum disetel di Render!");
-          return;
+        if (hasImage) {
+          imageMime = (content.imageMessage.mimetype || "image/jpeg").split(";")[0].trim();
+          addLog("GAMBAR", `Mendownload foto dari ${senderName}...`);
+          try {
+            const unwrappedMsg = { key: msg.key, message: content };
+            const buffer = await downloadMediaMessage(unwrappedMsg, "buffer", {});
+            imageBase64 = buffer.toString("base64");
+            addLog("GAMBAR", `📸 Foto berhasil diunduh (${(buffer.length / 1024).toFixed(1)} KB)`);
+          } catch (e) {
+            addLog("ERROR GAMBAR", `Gagal download foto: ${e.message}`);
+          }
         }
 
-        const payload = {
-          category: expense.category,
-          item: expense.item,
-          qty: expense.qty || "",
-          total: expense.total,
-          ket: expense.ket || `Dilaporkan oleh ${senderName}`,
-          dateNum: dateNum,
-          dateStr: fullDateStr
-        };
+        if (!text && !imageBase64) return;
 
-        const res = await fetch(EXPENSE_WEBHOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        const result = await res.json();
-        addLog("SHEET PENGELUARAN", `Respon: ${JSON.stringify(result)}`);
+        if (text) {
+          addLog("TEKS", `"${text}" dari ${senderName}`);
+        }
 
-        // Balas langsung di grup WhatsApp (Reply)
-        const replyText = `✅ *Tercatat ke [${expense.category} - ${getWeekTabName(dateNum)}]*\n`
-          + `• *Item:* ${expense.item} ${expense.qty ? `(${expense.qty})` : ""}\n`
-          + `• *Total:* ${formatRupiah}\n`
-          + `• *Pelapor:* ${senderName}`;
+        // Analisis menggunakan AI / Smart Parser
+        const expense = await parseExpenseWithAI(text, imageBase64, imageMime, GEMINI_API_KEY);
 
-        await sock.sendMessage(msg.key.remoteJid, { text: replyText }, { quoted: msg });
-      } else {
-        if (imageBase64) {
-          addLog("INFO", "Foto belum terdeteksi rincian biayanya");
-          const fallbackReply = `ℹ️ Foto struk/transfer diterima, namun rincian nominal belum terdeteksi.\n\nSilakan ketik rinciannya di grup ya (contoh: *beli semangka 50rb*).`;
-          await sock.sendMessage(msg.key.remoteJid, { text: fallbackReply }, { quoted: msg });
+        if (expense && expense.isExpense) {
+          const formatRupiah = `Rp ${Number(expense.total).toLocaleString("id-ID")}`;
+          addLog("PENGELUARAN", `💸 Terdeteksi: ${expense.item} (${formatRupiah}) [${expense.category}]`);
+
+          if (!EXPENSE_WEBHOOK_URL || EXPENSE_WEBHOOK_URL.includes("docs.google.com")) {
+            addLog("PERINGATAN", "EXPENSE_WEBHOOK_URL belum disetel di Render!");
+            return;
+          }
+
+          const payload = {
+            category: expense.category,
+            item: expense.item,
+            qty: expense.qty || "",
+            total: expense.total,
+            ket: expense.ket || `Dilaporkan oleh ${senderName}`,
+            dateNum: dateNum,
+            dateStr: fullDateStr
+          };
+
+          const res = await fetch(EXPENSE_WEBHOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const result = await res.json();
+          addLog("SHEET PENGELUARAN", `Respon: ${JSON.stringify(result)}`);
+
+          // Balas langsung di grup WhatsApp (Reply)
+          const replyText = `✅ *Tercatat ke [${expense.category} - ${getWeekTabName(dateNum)}]*\n`
+            + `• *Item:* ${expense.item} ${expense.qty ? `(${expense.qty})` : ""}\n`
+            + `• *Total:* ${formatRupiah}\n`
+            + `• *Pelapor:* ${senderName}`;
+
+          await sock.sendMessage(msg.key.remoteJid, { text: replyText }, { quoted: msg });
+        } else {
+          if (imageBase64) {
+            addLog("INFO", "Foto belum terdeteksi rincian biayanya");
+            const fallbackReply = `ℹ️ Foto struk/transfer diterima, namun rincian nominal belum terdeteksi.\n\nSilakan ketik rinciannya di grup ya (contoh: *beli semangka 50rb*).`;
+            await sock.sendMessage(msg.key.remoteJid, { text: fallbackReply }, { quoted: msg });
+          }
         }
       }
 
@@ -394,7 +402,6 @@ async function parseExpenseWithAI(text, imageBase64, imageMime, apiKey) {
   if (apiKey) {
     const parts = [];
     if (imageBase64) {
-      // Format resmi Google REST API: inline_data dengan mime_type dan data
       parts.push({
         inline_data: {
           mime_type: imageMime || "image/jpeg",
@@ -427,30 +434,41 @@ Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown back
 
     parts.unshift({ text: prompt });
 
-    // Model aktif Google Gemini resmi 2026 (sesuai respon resmi Google API: gemini-3.8-flash)
+    // Model resmi Google Gemini Flash 2026
     const candidateModels = [
       "gemini-3.8-flash",
-      "gemini-3.8-pro",
+      "gemini-3.5-flash",
       "gemini-3.0-flash",
-      "gemini-flash"
+      "gemini-2.5-flash"
     ];
 
     for (const mName of candidateModels) {
       try {
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${mName}:generateContent?key=${apiKey}`;
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: { 
-            "Content-Type": "application/json",
-            "x-goog-api-key": apiKey 
-          },
-          body: JSON.stringify({
-            contents: [{ parts: parts }],
-            generationConfig: { responseMimeType: "application/json" }
-          })
-        });
+        
+        // Panggil dengan toleransi retry jika ada spike permintaan sesaat (503)
+        let res = null;
+        let data = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          res = await fetch(endpoint, {
+            method: "POST",
+            headers: { 
+              "Content-Type": "application/json",
+              "x-goog-api-key": apiKey 
+            },
+            body: JSON.stringify({
+              contents: [{ parts: parts }],
+              generationConfig: { responseMimeType: "application/json" }
+            })
+          });
+          data = await res.json();
+          if (res.status === 503 && attempt === 0) {
+            await new Promise(r => setTimeout(r, 1500));
+            continue;
+          }
+          break;
+        }
 
-        const data = await res.json();
         if (res.ok && !data.error) {
           const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawText) {
@@ -461,7 +479,7 @@ Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown back
             }
           }
         } else {
-          addLog("AI RETRY", `Model ${mName} (${res.status}): ${data?.error?.message || "format error"}`);
+          addLog("AI RETRY", `Model ${mName} (${res.status}): ${data?.error?.message?.substring(0, 80) || "error"}`);
         }
       } catch (err) {
         addLog("AI RETRY", `Model ${mName} err: ${err.message}`);

@@ -18,7 +18,7 @@ if (!ATTENDANCE_WEBHOOK_URL || ATTENDANCE_WEBHOOK_URL.includes("docs.google.com"
   ATTENDANCE_WEBHOOK_URL = DEFAULT_ATTENDANCE_WEBHOOK;
 }
 
-const EXPENSE_WEBHOOK_URL = process.env.EXPENSE_WEBHOOK_URL || "";
+const EXPENSE_WEBHOOK_URL = process.env.EXPENSE_WEBHOOK_URL || "https://script.google.com/macros/s/AKfycbz4sbrv0czJ0O3EXcwRptUfjXNS_CA6UdrYXXFlYl08Fo-pzrhDeBe9vjeOtrffLVzL7g/exec";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const PORT = process.env.PORT || 3000;
 
@@ -64,7 +64,7 @@ app.get("/", (req, res) => {
           .badge-wait { background: #fef3c7; color: #b45309; }
           .btn { display: inline-block; padding: 8px 16px; background: #0284c7; color: white; text-decoration: none; border-radius: 8px; font-weight: 500; font-size: 13px; }
           .feature { background: #f1f5f9; padding: 14px 16px; border-radius: 10px; margin-top: 15px; font-size: 13px; line-height: 1.6; }
-          .log-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 230px; overflow-y: auto; margin-top: 15px; line-height: 1.5; }
+          .log-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 250px; overflow-y: auto; margin-top: 15px; line-height: 1.5; }
         </style>
       </head>
       <body>
@@ -78,10 +78,9 @@ app.get("/", (req, res) => {
           </div>
 
           <div class="feature">
-            <strong>⚙️ Status Konfigurasi & Grup Aktif:</strong><br>
-            • 📍 <strong>Grup Absensi:</strong> "absensi hungreens" (Shareloc &rarr; Google Sheets)<br>
-            • 💸 <strong>Grup Pengeluaran:</strong> "pengeluaran salad" (Nota/Struk/Transfer &rarr; OPEX & CAPEX)<br>
-            • 🔒 <strong>Grup Lain:</strong> Otomatis diabaikan untuk menjaga privasi.<br>
+            <strong>⚙️ Status Konfigurasi & Grup:</strong><br>
+            • 📍 <strong>Grup Absensi:</strong> "absensi hungreens"<br>
+            • 💸 <strong>Grup Pengeluaran:</strong> "pengeluaran salad"<br>
             • 🧠 <strong>Gemini AI Key:</strong> ${GEMINI_API_KEY 
                 ? `<span style='color:#15803d; font-weight:bold;'>✅ Aktif (${GEMINI_API_KEY.substring(0, 6)}...)</span>` 
                 : "<span style='color:#dc2626; font-weight:bold;'>⚠️ Belum Terpasang (GEMINI_API_KEY)</span>"}
@@ -91,10 +90,10 @@ app.get("/", (req, res) => {
           <div class="log-box">
             ${activityLogs.length > 0 
               ? activityLogs.map(l => `<div>${l}</div>`).join("") 
-              : "<div>Menunggu pesan masuk di grup Hungreens...</div>"
+              : "<div>Menunggu pesan masuk di grup WhatsApp...</div>"
             }
           </div>
-          <p style="font-size:11px; color:#64748b; text-align:center; margin-top:12px;">Refresh browser ini untuk memperbarui log secara langsung.</p>
+          <p style="font-size:11px; color:#64748b; text-align:center; margin-top:12px;">Refresh browser ini untuk melihat aktivitas terbaru.</p>
         </div>
       </body>
     </html>
@@ -158,12 +157,14 @@ async function getGroupName(sock, jid) {
   if (groupNameCache.has(jid)) return groupNameCache.get(jid);
   try {
     const meta = await sock.groupMetadata(jid);
-    const name = meta.subject || "";
-    groupNameCache.set(jid, name);
-    return name;
+    if (meta && meta.subject) {
+      groupNameCache.set(jid, meta.subject);
+      return meta.subject;
+    }
   } catch (e) {
-    return "";
+    // Jangan cache jika gagal
   }
+  return "";
 }
 
 function unwrapMessage(msg) {
@@ -187,32 +188,6 @@ function cleanAndParseJSON(str) {
     cleaned = cleaned.substring(firstBrace, lastBrace + 1);
   }
   return JSON.parse(cleaned);
-}
-
-// Cek daftar model yang aktif secara dinamis untuk akun pengguna
-let cachedModelName = null;
-async function getAvailableModel(apiKey) {
-  if (cachedModelName) return cachedModelName;
-  try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {
-      headers: { "x-goog-api-key": apiKey }
-    });
-    const data = await res.json();
-    if (data.models && Array.isArray(data.models)) {
-      const supported = data.models.filter(m => m.supportedGenerationMethods?.includes("generateContent"));
-      // Utamakan model flash (seperti gemini-2.5-flash atau gemini-2.0-flash)
-      const flash = supported.find(m => m.name.includes("flash"));
-      const picked = flash || supported[0];
-      if (picked) {
-        cachedModelName = picked.name.replace(/^models\//, "");
-        addLog("AI MODEL", `Model aktif yang dipilih: ${cachedModelName}`);
-        return cachedModelName;
-      }
-    }
-  } catch (e) {
-    console.error("Gagal mendeteksi model:", e);
-  }
-  return "gemini-2.5-flash"; // Fallback standar generasi terbaru
 }
 
 async function startWhatsAppBot() {
@@ -249,32 +224,49 @@ async function startWhatsAppBot() {
   sock.ev.on("messages.upsert", async (m) => {
     try {
       const msg = m.messages[0];
-      if (!msg.message) return;
+      if (!msg || !msg.message) return;
 
-      // 1. PENGAMAN UTAMA: Jangan pernah baca pesan yang dikirim oleh bot itu sendiri!
-      if (msg.key.fromMe) return;
-
-      // 2. Hanya proses pesan yang ada di grup
+      // Hanya proses pesan di grup
       const isGroup = msg.key.remoteJid.endsWith("@g.us");
       if (!isGroup) return;
-
-      // 3. FILTER NAMA GRUP: Hanya baca grup "absensi hungreens" dan "pengeluaran salad"
-      const groupName = (await getGroupName(sock, msg.key.remoteJid)).toLowerCase();
-      const isAttendanceGroup = groupName.includes("absen");
-      const isExpenseGroup = groupName.includes("pengeluaran") || groupName.includes("salad");
-
-      if (!isAttendanceGroup && !isExpenseGroup) {
-        // Abaikan semua grup lain (grup teman, komunitas, story pedia, dll)
-        return;
-      }
 
       // Buka bungkusan pesan (mendukung pesan sementara / ephemeral / view once)
       const content = unwrapMessage(msg);
 
+      let text = content.conversation 
+        || content.extendedTextMessage?.text 
+        || content.imageMessage?.caption 
+        || "";
+
+      // 1. PENGAMAN LOOP BOT:
+      // Abaikan HANYA pesan yang dihasilkan oleh bot (berisi emoji konfirmasi bot)
+      // JANGAN filter msg.key.fromMe, agar owner tetap bisa kirim bukti transfer & tes bot!
+      if (text.startsWith("✅") || text.startsWith("ℹ️") || text.startsWith("⚠️") || text.includes("*Tercatat ke [")) {
+        return;
+      }
+
       const senderJid = msg.key.participant || msg.key.remoteJid;
       const cleanPhone = senderJid.replace(/@.+/, "").replace(/\D/g, "");
-      const pushName = msg.pushName || "Karyawan";
+      const pushName = msg.pushName || (msg.key.fromMe ? "Owner (Dimmy)" : "Karyawan");
       const senderName = EMPLOYEE_MAP[cleanPhone] || pushName;
+
+      // Cek tipe pesan
+      const isLocation = !!(content.locationMessage || content.liveLocationMessage);
+      const hasImage = !!content.imageMessage;
+
+      // Cek nama grup secara aman
+      let groupName = "";
+      try {
+        groupName = (await getGroupName(sock, msg.key.remoteJid)).toLowerCase();
+      } catch (e) {}
+
+      // Jika nama grup terdeteksi dan BUKAN grup Hungreens (misal grup lain), abaikan!
+      if (groupName) {
+        const isHungreens = groupName.includes("absen") || groupName.includes("pengeluaran") || groupName.includes("salad") || groupName.includes("hungreens");
+        if (!isHungreens) {
+          return; // Abaikan grup luar
+        }
+      }
 
       // Waktu Pesan
       const timestampSeconds = msg.messageTimestamp;
@@ -284,108 +276,111 @@ async function startWhatsAppBot() {
       const dateNum = parseInt(new Intl.DateTimeFormat("id-ID", { timeZone: "Asia/Jakarta", day: "numeric" }).format(dateObj), 10);
       const fullDateStr = `${dateNum} November 2026`;
 
-      // ==============================================================
-      // MODUL 1: ABSENSI (HANYA AKTIF DI GRUP ABSENSI)
-      // ==============================================================
-      if (isAttendanceGroup) {
-        const isLocation = content.locationMessage || content.liveLocationMessage;
-        if (isLocation) {
-          addLog("ABSENSI", `📍 Shareloc dari ${senderName} (${timeStr} WIB, tgl ${dateNum})`);
+      // Log pesan yang masuk langsung ke monitor
+      const tipeMsg = isLocation ? "SHARELOC" : (hasImage ? "FOTO" : "TEKS");
+      addLog("CHAT MASUK", `Dari ${senderName} [${tipeMsg}]`);
 
-          const payload = {
-            name: senderName,
-            phone: cleanPhone,
-            time: timeStr,
-            dayName: dayName,
-            dateNum: dateNum
-          };
-
-          const response = await fetch(ATTENDANCE_WEBHOOK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-          const result = await response.json();
-          addLog("SHEET ABSEN", `Respon: ${JSON.stringify(result)}`);
+      // ==============================================================
+      // MODUL 1: ABSENSI (HANYA UNTUK PESAN SHARELOC)
+      // ==============================================================
+      if (isLocation) {
+        // Jika nama grup pengeluaran, jangan proses absen di sini
+        if (groupName && (groupName.includes("pengeluaran") || groupName.includes("salad"))) {
+          return;
         }
-        return; // Jangan lanjutkan ke modul pengeluaran jika di grup absensi
+
+        addLog("ABSENSI", `📍 Shareloc dari ${senderName} (${timeStr} WIB, tgl ${dateNum})`);
+
+        const payload = {
+          name: senderName,
+          phone: cleanPhone,
+          time: timeStr,
+          dayName: dayName,
+          dateNum: dateNum
+        };
+
+        const response = await fetch(ATTENDANCE_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        addLog("SHEET ABSEN", `Respon: ${JSON.stringify(result)}`);
+        return;
       }
 
       // ==============================================================
-      // MODUL 2: PENGELUARAN (HANYA AKTIF DI GRUP PENGELUARAN SALAD)
+      // MODUL 2: PENGELUARAN (FOTO NOTA / BUKTI TRANSFER / TEKS BIAYA)
       // ==============================================================
-      if (isExpenseGroup) {
-        let text = content.conversation 
-          || content.extendedTextMessage?.text 
-          || content.imageMessage?.caption 
-          || "";
+      // Jika nama grup terdeteksi absen, jangan proses pengeluaran di sini
+      if (groupName && groupName.includes("absen")) {
+        return;
+      }
 
-        let imageBase64 = null;
-        let imageMime = "image/jpeg";
+      let imageBase64 = null;
+      let imageMime = "image/jpeg";
 
-        if (content.imageMessage) {
-          imageMime = (content.imageMessage.mimetype || "image/jpeg").split(";")[0].trim();
-          addLog("GAMBAR", `Mendownload foto nota/transfer dari ${senderName}...`);
-          try {
-            const unwrappedMsg = { key: msg.key, message: content };
-            const buffer = await downloadMediaMessage(unwrappedMsg, "buffer", {});
-            imageBase64 = buffer.toString("base64");
-            addLog("GAMBAR", `📸 Foto berhasil diunduh (${(buffer.length / 1024).toFixed(1)} KB)`);
-          } catch (e) {
-            addLog("ERROR GAMBAR", `Gagal download foto: ${e.message}`);
-          }
+      if (hasImage) {
+        imageMime = (content.imageMessage.mimetype || "image/jpeg").split(";")[0].trim();
+        addLog("GAMBAR", `Mendownload foto dari ${senderName}...`);
+        try {
+          const unwrappedMsg = { key: msg.key, message: content };
+          const buffer = await downloadMediaMessage(unwrappedMsg, "buffer", {});
+          imageBase64 = buffer.toString("base64");
+          addLog("GAMBAR", `📸 Foto berhasil diunduh (${(buffer.length / 1024).toFixed(1)} KB)`);
+        } catch (e) {
+          addLog("ERROR GAMBAR", `Gagal download foto: ${e.message}`);
+        }
+      }
+
+      if (!text && !imageBase64) return;
+
+      if (text) {
+        addLog("TEKS", `"${text}" dari ${senderName}`);
+      }
+
+      // Analisis menggunakan AI / Smart Parser
+      const expense = await parseExpenseWithAI(text, imageBase64, imageMime, GEMINI_API_KEY);
+
+      if (expense && expense.isExpense) {
+        const formatRupiah = `Rp ${Number(expense.total).toLocaleString("id-ID")}`;
+        addLog("PENGELUARAN", `💸 Terdeteksi: ${expense.item} (${formatRupiah}) [${expense.category}]`);
+
+        if (!EXPENSE_WEBHOOK_URL || EXPENSE_WEBHOOK_URL.includes("docs.google.com")) {
+          addLog("PERINGATAN", "EXPENSE_WEBHOOK_URL belum disetel di Render!");
+          return;
         }
 
-        if (!text && !imageBase64) return;
+        const payload = {
+          category: expense.category,
+          item: expense.item,
+          qty: expense.qty || "",
+          total: expense.total,
+          ket: expense.ket || `Dilaporkan oleh ${senderName}`,
+          dateNum: dateNum,
+          dateStr: fullDateStr
+        };
 
-        if (text) {
-          addLog("TEKS", `"${text}" dari ${senderName}`);
-        }
+        const res = await fetch(EXPENSE_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await res.json();
+        addLog("SHEET PENGELUARAN", `Respon: ${JSON.stringify(result)}`);
 
-        // Analisis menggunakan AI / Smart Parser
-        const expense = await parseExpenseWithAI(text, imageBase64, imageMime, GEMINI_API_KEY);
+        // Balas langsung di grup WhatsApp (Reply)
+        const replyText = `✅ *Tercatat ke [${expense.category} - ${getWeekTabName(dateNum)}]*\n`
+          + `• *Item:* ${expense.item} ${expense.qty ? `(${expense.qty})` : ""}\n`
+          + `• *Total:* ${formatRupiah}\n`
+          + `• *Pelapor:* ${senderName}`;
 
-        if (expense && expense.isExpense) {
-          const formatRupiah = `Rp ${Number(expense.total).toLocaleString("id-ID")}`;
-          addLog("PENGELUARAN", `💸 Terdeteksi: ${expense.item} (${formatRupiah}) [${expense.category}]`);
-
-          if (!EXPENSE_WEBHOOK_URL || EXPENSE_WEBHOOK_URL.includes("docs.google.com")) {
-            addLog("PERINGATAN", "EXPENSE_WEBHOOK_URL belum disetel di Render!");
-            return;
-          }
-
-          const payload = {
-            category: expense.category,
-            item: expense.item,
-            qty: expense.qty || "",
-            total: expense.total,
-            ket: expense.ket || `Dilaporkan oleh ${senderName}`,
-            dateNum: dateNum,
-            dateStr: fullDateStr
-          };
-
-          const res = await fetch(EXPENSE_WEBHOOK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-          const result = await res.json();
-          addLog("SHEET PENGELUARAN", `Respon: ${JSON.stringify(result)}`);
-
-          // Balas langsung di grup WhatsApp (Reply)
-          const replyText = `✅ *Tercatat ke [${expense.category} - ${getWeekTabName(dateNum)}]*\n`
-            + `• *Item:* ${expense.item} ${expense.qty ? `(${expense.qty})` : ""}\n`
-            + `• *Total:* ${formatRupiah}\n`
-            + `• *Pelapor:* ${senderName}`;
-
-          await sock.sendMessage(msg.key.remoteJid, { text: replyText }, { quoted: msg });
-        } else {
-          // Jika ada foto dikirim tetapi AI tidak mendeteksi nominal
-          if (imageBase64) {
-            addLog("INFO", "Foto belum terdeteksi rincian biayanya");
-            const fallbackReply = `ℹ️ Foto struk/transfer diterima, namun rincian nominal belum terdeteksi.\n\nSilakan ketik rinciannya di grup ya (contoh: *beli semangka 50rb*).`;
-            await sock.sendMessage(msg.key.remoteJid, { text: fallbackReply }, { quoted: msg });
-          }
+        await sock.sendMessage(msg.key.remoteJid, { text: replyText }, { quoted: msg });
+      } else {
+        if (imageBase64) {
+          addLog("INFO", "Foto belum terdeteksi rincian biayanya");
+          const fallbackReply = `ℹ️ Foto struk/transfer diterima, namun rincian nominal belum terdeteksi.\n\nSilakan ketik rinciannya di grup ya (contoh: *beli semangka 50rb*).`;
+          await sock.sendMessage(msg.key.remoteJid, { text: fallbackReply }, { quoted: msg });
         }
       }
 
@@ -398,25 +393,24 @@ async function startWhatsAppBot() {
 
 async function parseExpenseWithAI(text, imageBase64, imageMime, apiKey) {
   if (apiKey) {
-    try {
-      const parts = [];
-      if (imageBase64) {
-        parts.push({ inlineData: { mimeType: imageMime || "image/jpeg", data: imageBase64 } });
-      }
-      if (text) {
-        parts.push({ text: `Pesan chat pengeluaran: "${text}"` });
-      } else {
-        parts.push({ text: "Analisis foto bukti transfer, struk belanja, atau nota pembelian ini. Baca nama barang/keperluan, jumlah qty jika ada, dan TOTAL nominal rupiah yang dibayarkan." });
-      }
+    const parts = [];
+    if (imageBase64) {
+      parts.push({ inlineData: { mimeType: imageMime || "image/jpeg", data: imageBase64 } });
+    }
+    if (text) {
+      parts.push({ text: `Pesan chat pengeluaran: "${text}"` });
+    } else {
+      parts.push({ text: "Analisis foto bukti transfer, struk belanja, atau nota pembelian ini. Baca nama barang/keperluan, jumlah qty jika ada, dan TOTAL nominal rupiah yang dibayarkan." });
+    }
 
-      const prompt = `Kamu adalah asisten keuangan untuk outlet makanan sehat bernama 'Hungreens' di Indonesia.
+    const prompt = `Kamu adalah asisten keuangan untuk outlet makanan sehat bernama 'Hungreens' di Indonesia.
 Tugasmu: Analisis apakah pesan/foto ini merupakan laporan pengeluaran, nota belanja, atau bukti transfer operasional.
 Aturan Kategori:
 - OPEX: Bahan baku makanan/minuman (buah, sayur, ayam, ikan, bumbu/saus, minyak, beras/rice paper, keju, chia seed) dan kemasan makanan (plastik kresek, lunch box, cup).
 - CAPEX: Kebutuhan operasional outlet non-makanan (listrik/token PLN, air/PDAM, gas elpiji, galon air, wifi/internet, sabun pel, pembersih dapur, tisu, cetak stiker, perlengkapan toko).
 - Jika HANYA obrolan biasa, pertanyaan, sapaan, atau diskusi yang bukan biaya -> set isExpense: false.
 
-Kembalikan format JSON persis seperti ini (hanya JSON, tanpa format markdown):
+Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa backtick markdown):
 {
   "isExpense": true atau false,
   "category": "OPEX" atau "CAPEX",
@@ -426,41 +420,45 @@ Kembalikan format JSON persis seperti ini (hanya JSON, tanpa format markdown):
   "ket": "keterangan toko / supplier / nama penerima"
 }`;
 
-      parts.unshift({ text: prompt });
+    parts.unshift({ text: prompt });
 
-      // Deteksi model yang tersedia secara dinamis
-      const modelName = await getAvailableModel(apiKey);
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+    // Coba model generasi terbaru secara berurutan
+    const candidateModels = [
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash-latest",
+      "gemini-1.5-pro"
+    ];
 
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey 
-        },
-        body: JSON.stringify({
-          contents: [{ parts: parts }],
-          generationConfig: { responseMimeType: "application/json" }
-        })
-      });
+    for (const mName of candidateModels) {
+      try {
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${mName}:generateContent?key=${apiKey}`;
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey 
+          },
+          body: JSON.stringify({
+            contents: [{ parts: parts }],
+            generationConfig: { responseMimeType: "application/json" }
+          })
+        });
 
-      const data = await res.json();
-      
-      if (!res.ok || data.error) {
-        const errorMsg = data?.error?.message || `HTTP ${res.status}`;
-        addLog("AI ERROR", `Gemini API Gagal: ${errorMsg}`);
-      } else {
-        const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (rawText) {
-          const parsed = cleanAndParseJSON(rawText);
-          if (parsed && typeof parsed.total === "number" && parsed.total > 0) {
-            return parsed;
+        const data = await res.json();
+        if (res.ok && !data.error) {
+          const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (rawText) {
+            const parsed = cleanAndParseJSON(rawText);
+            if (parsed && typeof parsed.total === "number" && parsed.total > 0) {
+              addLog("AI SUCCESS", `Model ${mName} berhasil menganalisis foto!`);
+              return parsed;
+            }
           }
         }
+      } catch (err) {
+        // coba model berikutnya
       }
-    } catch (e) {
-      addLog("AI EXCEPTION", e.message);
-      console.error("Gemini API Exception, fallback ke regex:", e);
     }
   }
 

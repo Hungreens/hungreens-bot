@@ -239,8 +239,7 @@ async function startWhatsAppBot() {
         || "";
 
       // 1. PENGAMAN LOOP BOT:
-      // Abaikan HANYA pesan yang dihasilkan oleh bot (berisi emoji konfirmasi bot)
-      // JANGAN filter msg.key.fromMe, agar owner tetap bisa kirim bukti transfer & tes bot!
+      // Abaikan HANYA pesan yang diawali format konfirmasi bot
       if (text.startsWith("✅") || text.startsWith("ℹ️") || text.startsWith("⚠️") || text.includes("*Tercatat ke [")) {
         return;
       }
@@ -395,12 +394,18 @@ async function parseExpenseWithAI(text, imageBase64, imageMime, apiKey) {
   if (apiKey) {
     const parts = [];
     if (imageBase64) {
-      parts.push({ inlineData: { mimeType: imageMime || "image/jpeg", data: imageBase64 } });
+      // Format resmi Google REST API: inline_data dengan mime_type dan data
+      parts.push({
+        inline_data: {
+          mime_type: imageMime || "image/jpeg",
+          data: imageBase64
+        }
+      });
     }
     if (text) {
       parts.push({ text: `Pesan chat pengeluaran: "${text}"` });
     } else {
-      parts.push({ text: "Analisis foto bukti transfer, struk belanja, atau nota pembelian ini. Baca nama barang/keperluan, jumlah qty jika ada, dan TOTAL nominal rupiah yang dibayarkan." });
+      parts.push({ text: "Analisis foto bukti transfer Shopee, struk belanja, atau nota pembelian ini. Baca nama barang/keperluan, jumlah qty jika ada (misal: 1kg 5pcs), dan TOTAL nominal rupiah yang dibayarkan (misal: Rp697.440)." });
     }
 
     const prompt = `Kamu adalah asisten keuangan untuk outlet makanan sehat bernama 'Hungreens' di Indonesia.
@@ -410,19 +415,19 @@ Aturan Kategori:
 - CAPEX: Kebutuhan operasional outlet non-makanan (listrik/token PLN, air/PDAM, gas elpiji, galon air, wifi/internet, sabun pel, pembersih dapur, tisu, cetak stiker, perlengkapan toko).
 - Jika HANYA obrolan biasa, pertanyaan, sapaan, atau diskusi yang bukan biaya -> set isExpense: false.
 
-Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa backtick markdown):
+Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown backtick):
 {
   "isExpense": true atau false,
   "category": "OPEX" atau "CAPEX",
   "item": "nama barang / keperluan transfer",
-  "qty": "jumlah jika ada (contoh: 5 kg, 2 pcs)",
+  "qty": "jumlah jika ada (contoh: 5 pcs, 5 kg, 2 pak)",
   "total": angka murni nominal rupiah tanpa titik/koma (contoh: 697440),
   "ket": "keterangan toko / supplier / nama penerima"
 }`;
 
     parts.unshift({ text: prompt });
 
-    // Coba model generasi terbaru secara berurutan
+    // Daftar model aktif Google Gemini untuk dicoba secara berurutan
     const candidateModels = [
       "gemini-2.5-flash",
       "gemini-2.0-flash",
@@ -451,17 +456,20 @@ Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa backtick mark
           if (rawText) {
             const parsed = cleanAndParseJSON(rawText);
             if (parsed && typeof parsed.total === "number" && parsed.total > 0) {
-              addLog("AI SUCCESS", `Model ${mName} berhasil menganalisis foto!`);
+              addLog("AI SUCCESS", `Foto dibaca oleh [${mName}]: ${parsed.item} (Rp ${parsed.total.toLocaleString('id-ID')})`);
               return parsed;
             }
           }
+        } else {
+          addLog("AI RETRY", `Model ${mName} (${res.status}): ${data?.error?.message || "format error"}`);
         }
       } catch (err) {
-        // coba model berikutnya
+        addLog("AI RETRY", `Model ${mName} err: ${err.message}`);
       }
     }
   }
 
+  // Fallback cerdas jika AI offline atau jika teks manual
   return parseExpenseFallback(text);
 }
 
@@ -469,28 +477,47 @@ function parseExpenseFallback(text) {
   if (!text) return { isExpense: false };
 
   // Abaikan pesan otomatis bot sendiri atau pesan instruksi
-  if (text.includes("contoh:") || text.includes("Foto struk/transfer") || text.includes("Foto bukti") || text.includes("Tercatat ke [")) {
+  if (text.startsWith("✅") || text.startsWith("ℹ️") || text.startsWith("⚠️") || text.includes("*Tercatat ke [") || text.includes("contoh:")) {
     return { isExpense: false };
   }
 
-  const lower = text.toLowerCase();
-  if (lower.includes("jangan lupa") || lower.includes("besok") || lower.includes("jadwal") || lower.includes("masuk") || lower.includes("halo") || lower.includes("pagi")) {
-    return { isExpense: false };
+  const clean = text.trim();
+
+  // 1. Cari Nominal Harga:
+  // Prioritaskan Rp..., angka bertitik ribuan (contoh 697.440 atau 50.000), atau angka + rb/k/ribu (contoh 50rb, 100k)
+  // JANGAN cocokkan akhiran kg / koli / km / kaleng sebagai nominal
+  const priceMatch = clean.match(/(?:rp\.?\s*(\d{1,3}(?:[.,]\d{3})*|\d+)|\b(\d{1,3}(?:[.,]\d{3})+)\b|\b(\d+)\s*(rb|k|ribu)\b(?!\w))/i);
+  if (!priceMatch) return { isExpense: false };
+
+  const fullPriceStr = priceMatch[0];
+  let rawNum = priceMatch[1] || priceMatch[2] || priceMatch[3];
+  const unit = (priceMatch[4] || "").toLowerCase();
+
+  rawNum = rawNum.replace(/[.,]/g, "");
+  let total = parseInt(rawNum, 10);
+  if (unit === "rb" || unit === "k" || unit === "ribu") {
+    total *= 1000;
   }
-
-  const nominalMatch = lower.match(/(?:rp\.?\s*)?(\d{1,3}(?:[.,]\d{3})*|\d+)\s*(rb|k|ribu)?/i);
-  if (!nominalMatch) return { isExpense: false };
-
-  let rawNum = nominalMatch[1].replace(/[.,]/g, "");
-  let multiplier = 1;
-  const unit = (nominalMatch[2] || "").toLowerCase();
-  if (unit === "rb" || unit === "k" || unit === "ribu") multiplier = 1000;
-  let total = parseInt(rawNum, 10) * multiplier;
 
   if (total < 1000) return { isExpense: false };
 
-  let item = text.replace(nominalMatch[0], "").replace(/beli|bayar|tadi|untuk/gi, "").trim();
-  if (!item || item.length > 50) item = "Belanja Operasional";
+  // 2. Hapus string harga dari teks untuk mencari item dan qty
+  let rem = clean.replace(fullPriceStr, "").trim();
+
+  // 3. Cari Quantity (contoh: 1kg, 5pcs, 2 pak, 1 dus, 3 btl, 1 sisir, dll)
+  const qtyRegex = /\b\d+(?:[.,]\d+)?\s*(?:kg|g|gram|ons|pcs|pc|pak|dus|btl|botol|ikat|iket|sisir|kaleng|butir|sak|roll|lembar)\b/gi;
+  const qtyMatches = rem.match(qtyRegex);
+  const qtyStr = qtyMatches ? qtyMatches.join(" ") : "";
+
+  // 4. Sisanya adalah Item Barang
+  let item = rem;
+  if (qtyMatches) {
+    for (const q of qtyMatches) {
+      item = item.replace(new RegExp(q, "gi"), "");
+    }
+  }
+  item = item.replace(/\b(beli|bayar|tadi|untuk)\b/gi, "").replace(/^[,\s.-]+|[,\s.-]+$/g, "").trim();
+  if (!item || item.length > 50) item = "Belanja Bahan";
 
   const capexKeywords = ["gas", "elpiji", "galon", "token", "pln", "listrik", "air", "pdam", "wifi", "indosat", "sabun", "pel", "tisu", "stiker", "sarung tangan"];
   const isCapex = capexKeywords.some(k => item.toLowerCase().includes(k));
@@ -499,7 +526,7 @@ function parseExpenseFallback(text) {
     isExpense: true,
     category: isCapex ? "CAPEX" : "OPEX",
     item: item,
-    qty: "",
+    qty: qtyStr,
     total: total,
     ket: ""
   };

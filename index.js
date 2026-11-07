@@ -427,12 +427,12 @@ Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown back
 
     parts.unshift({ text: prompt });
 
-    // Daftar model aktif Google Gemini untuk dicoba secara berurutan
+    // Model aktif Google Gemini resmi 2026 (sesuai respon resmi Google API: gemini-3.8-flash)
     const candidateModels = [
-      "gemini-2.5-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash-latest",
-      "gemini-1.5-pro"
+      "gemini-3.8-flash",
+      "gemini-3.8-pro",
+      "gemini-3.0-flash",
+      "gemini-flash"
     ];
 
     for (const mName of candidateModels) {

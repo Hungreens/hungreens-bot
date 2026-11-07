@@ -59,13 +59,13 @@ app.get("/", (req, res) => {
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
           body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 30px 15px; background: #f8fafc; color: #1e293b; }
-          .card { max-width: 540px; margin: 0 auto; background: white; padding: 25px; border-radius: 16px; box-shadow: 0 4px 25px rgba(0,0,0,0.07); text-align: left; }
+          .card { max-width: 560px; margin: 0 auto; background: white; padding: 25px; border-radius: 16px; box-shadow: 0 4px 25px rgba(0,0,0,0.07); text-align: left; }
           .badge { display: inline-block; padding: 6px 16px; border-radius: 20px; font-weight: bold; font-size: 14px; margin-bottom: 15px; }
           .badge-online { background: #dcfce7; color: #15803d; }
           .badge-wait { background: #fef3c7; color: #b45309; }
           .btn { display: inline-block; padding: 8px 16px; background: #0284c7; color: white; text-decoration: none; border-radius: 8px; font-weight: 500; font-size: 13px; }
           .feature { background: #f1f5f9; padding: 14px 16px; border-radius: 10px; margin-top: 15px; font-size: 13px; line-height: 1.6; }
-          .log-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 200px; overflow-y: auto; margin-top: 15px; line-height: 1.5; }
+          .log-box { background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 220px; overflow-y: auto; margin-top: 15px; line-height: 1.5; }
         </style>
       </head>
       <body>
@@ -139,6 +139,7 @@ app.get("/logs", (req, res) => {
     isConnected,
     config: {
       attendanceUrl: ATTENDANCE_WEBHOOK_URL,
+      expenseUrl: EXPENSE_WEBHOOK_URL,
       hasExpenseWebhook: !!EXPENSE_WEBHOOK_URL,
       hasGeminiApiKey: !!GEMINI_API_KEY
     },
@@ -157,7 +158,6 @@ app.listen(PORT, () => {
 function unwrapMessage(msg) {
   let m = msg.message;
   if (!m) return {};
-  // Menembus berbagai lapisan bungkus pesan di Baileys (Pesan Sementara, ViewOnce, Dokumen, dll)
   while (m.ephemeralMessage || m.viewOnceMessage || m.viewOnceMessageV2 || m.documentWithCaptionMessage) {
     m = m.ephemeralMessage?.message 
       || m.viewOnceMessage?.message 
@@ -165,6 +165,17 @@ function unwrapMessage(msg) {
       || m.documentWithCaptionMessage?.message;
   }
   return m || {};
+}
+
+function cleanAndParseJSON(str) {
+  if (!str) return null;
+  let cleaned = str.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+  }
+  return JSON.parse(cleaned);
 }
 
 async function startWhatsAppBot() {
@@ -225,10 +236,6 @@ async function startWhatsAppBot() {
       const dateNum = parseInt(new Intl.DateTimeFormat("id-ID", { timeZone: "Asia/Jakarta", day: "numeric" }).format(dateObj), 10);
       const fullDateStr = `${dateNum} November 2026`;
 
-      // Log tipe pesan yang diterima untuk diagnostic
-      const messageKeys = Object.keys(content);
-      addLog("CHAT MASUK", `Dari ${senderName} (${cleanPhone}) [${messageKeys.join(", ")}]`);
-
       // ==============================================================
       // 1. JIKA PESAN BERUPA SHARE LOCATION -> MODUL ABSENSI
       // ==============================================================
@@ -263,13 +270,16 @@ async function startWhatsAppBot() {
         || "";
 
       let imageBase64 = null;
-      if (content.imageMessage && GEMINI_API_KEY) {
+      let imageMime = "image/jpeg";
+
+      if (content.imageMessage) {
+        imageMime = (content.imageMessage.mimetype || "image/jpeg").split(";")[0].trim();
+        addLog("GAMBAR", `Mendownload foto nota/transfer dari ${senderName}...`);
         try {
-          // Bungkus dalam format yang diharapkan downloadMediaMessage
           const unwrappedMsg = { key: msg.key, message: content };
           const buffer = await downloadMediaMessage(unwrappedMsg, "buffer", {});
           imageBase64 = buffer.toString("base64");
-          addLog("GAMBAR", `📸 Foto bukti berhasil didownload (${(buffer.length / 1024).toFixed(1)} KB)`);
+          addLog("GAMBAR", `📸 Foto berhasil diunduh (${(buffer.length / 1024).toFixed(1)} KB, tipe: ${imageMime})`);
         } catch (e) {
           addLog("ERROR GAMBAR", `Gagal download foto: ${e.message}`);
         }
@@ -277,8 +287,12 @@ async function startWhatsAppBot() {
 
       if (!text && !imageBase64) return;
 
+      if (text) {
+        addLog("TEKS", `"${text}" dari ${senderName}`);
+      }
+
       // Analisis menggunakan AI / Smart Parser
-      const expense = await parseExpenseWithAI(text, imageBase64, GEMINI_API_KEY);
+      const expense = await parseExpenseWithAI(text, imageBase64, imageMime, GEMINI_API_KEY);
 
       if (expense && expense.isExpense) {
         const formatRupiah = `Rp ${Number(expense.total).toLocaleString("id-ID")}`;
@@ -323,6 +337,13 @@ async function startWhatsAppBot() {
           + `• *Pelapor:* ${senderName}`;
 
         await sock.sendMessage(msg.key.remoteJid, { text: replyText }, { quoted: msg });
+      } else {
+        // Jika ada foto tetapi AI tidak mendeteksi sebagai pengeluaran
+        if (imageBase64) {
+          addLog("INFO", "Foto diterima, tetapi tidak terdeteksi sebagai pengeluaran/nominal Rp 0");
+          const fallbackReply = `ℹ️ Foto bukti berhasil diterima, tetapi AI belum dapat membaca rincian nominal secara jelas.\n\nSilakan ketik manual rinciannya di grup ya (contoh: *beli galon 24rb* atau *andewi 5kg 50rb*).`;
+          await sock.sendMessage(msg.key.remoteJid, { text: fallbackReply }, { quoted: msg });
+        }
       }
 
     } catch (err) {
@@ -332,12 +353,12 @@ async function startWhatsAppBot() {
   });
 }
 
-async function parseExpenseWithAI(text, imageBase64, apiKey) {
+async function parseExpenseWithAI(text, imageBase64, imageMime, apiKey) {
   if (apiKey) {
     try {
       const parts = [];
       if (imageBase64) {
-        parts.push({ inlineData: { mimeType: "image/jpeg", data: imageBase64 } });
+        parts.push({ inlineData: { mimeType: imageMime || "image/jpeg", data: imageBase64 } });
       }
       if (text) {
         parts.push({ text: `Pesan chat pengeluaran: "${text}"` });
@@ -352,7 +373,7 @@ Aturan Kategori:
 - CAPEX: Kebutuhan operasional outlet non-makanan (listrik/token PLN, air/PDAM, gas elpiji, galon air, wifi/internet, sabun pel, pembersih dapur, tisu, cetak stiker, perlengkapan toko).
 - Jika HANYA obrolan biasa, pertanyaan, sapaan, atau diskusi yang bukan biaya -> set isExpense: false.
 
-Kembalikan format JSON persis seperti ini:
+Kembalikan format JSON persis seperti ini (tanpa markdown backtick jika memungkinkan):
 {
   "isExpense": true atau false,
   "category": "OPEX" atau "CAPEX",
@@ -364,9 +385,14 @@ Kembalikan format JSON persis seperti ini:
 
       parts.unshift({ text: prompt });
 
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+      // Coba panggil Gemini API dengan x-goog-api-key header & parameter key
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+      const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey 
+        },
         body: JSON.stringify({
           contents: [{ parts: parts }],
           generationConfig: { responseMimeType: "application/json" }
@@ -374,10 +400,20 @@ Kembalikan format JSON persis seperti ini:
       });
 
       const data = await res.json();
-      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (rawText) return JSON.parse(rawText);
+      
+      if (!res.ok || data.error) {
+        const errorMsg = data?.error?.message || `HTTP ${res.status}`;
+        addLog("AI ERROR", `Gemini API Gagal: ${errorMsg}`);
+      } else {
+        const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (rawText) {
+          const parsed = cleanAndParseJSON(rawText);
+          if (parsed) return parsed;
+        }
+      }
     } catch (e) {
-      console.error("Gemini API Error, fallback ke regex:", e);
+      addLog("AI EXCEPTION", e.message);
+      console.error("Gemini API Exception, fallback ke regex:", e);
     }
   }
 

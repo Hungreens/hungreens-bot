@@ -345,12 +345,16 @@ async function startWhatsAppBot() {
           addLog("TEKS", `"${text}" dari ${senderName}`);
         }
 
-        // Analisis menggunakan AI / Smart Parser
-        const expense = await parseExpenseWithAI(text, imageBase64, imageMime, GEMINI_API_KEY);
+        // Analisis menggunakan AI / Smart Multi-Item Parser
+        const expenseData = await parseExpenseWithAI(text, imageBase64, imageMime, GEMINI_API_KEY);
 
-        if (expense && expense.isExpense) {
-          const formatRupiah = `Rp ${Number(expense.total).toLocaleString("id-ID")}`;
-          addLog("PENGELUARAN", `💸 Terdeteksi: ${expense.item} (${formatRupiah}) [${expense.category}]`);
+        if (expenseData && expenseData.isExpense && Array.isArray(expenseData.items) && expenseData.items.length > 0) {
+          const items = expenseData.items;
+          const grandTotal = items.reduce((sum, it) => sum + (Number(it.total) || 0), 0);
+          const formatGrandTotal = `Rp ${grandTotal.toLocaleString("id-ID")}`;
+          const weekTab = getWeekTabName(dateNum);
+
+          addLog("PENGELUARAN", `💸 ${items.length} item dicatat: Total ${formatGrandTotal} [${weekTab}]`);
 
           if (!EXPENSE_WEBHOOK_URL || EXPENSE_WEBHOOK_URL.includes("docs.google.com")) {
             addLog("PERINGATAN", "EXPENSE_WEBHOOK_URL belum disetel di Render!");
@@ -358,13 +362,10 @@ async function startWhatsAppBot() {
           }
 
           const payload = {
-            category: expense.category,
-            item: expense.item,
-            qty: expense.qty || "",
-            total: expense.total,
-            ket: expense.ket || `Dilaporkan oleh ${senderName}`,
+            items: items,
             dateNum: dateNum,
-            dateStr: fullDateStr
+            dateStr: fullDateStr,
+            ket: `Dilaporkan oleh ${senderName}`
           };
 
           const res = await fetch(EXPENSE_WEBHOOK_URL, {
@@ -376,16 +377,31 @@ async function startWhatsAppBot() {
           addLog("SHEET PENGELUARAN", `Respon: ${JSON.stringify(result)}`);
 
           // Balas langsung di grup WhatsApp (Reply)
-          const replyText = `✅ *Tercatat ke [${expense.category} - ${getWeekTabName(dateNum)}]*\n`
-            + `• *Item:* ${expense.item} ${expense.qty ? `(${expense.qty})` : ""}\n`
-            + `• *Total:* ${formatRupiah}\n`
-            + `• *Pelapor:* ${senderName}`;
+          let replyText = "";
+          if (items.length === 1) {
+            const it = items[0];
+            const itemTotalStr = `Rp ${Number(it.total).toLocaleString("id-ID")}`;
+            replyText = `✅ *Tercatat ke [${weekTab} - ${it.category}]*\n`
+              + `• *Item:* ${it.item} ${it.qty ? `(${it.qty})` : ""}\n`
+              + `• *Total:* ${itemTotalStr}\n`
+              + (it.ket ? `• *Keterangan:* ${it.ket}\n` : "")
+              + `• *Pelapor:* ${senderName}`;
+          } else {
+            replyText = `✅ *Tercatat ke [${weekTab}] (${items.length} item terpisah):*\n`;
+            items.forEach((it, idx) => {
+              const itPrice = `Rp ${Number(it.total).toLocaleString("id-ID")}`;
+              const qtyStr = it.qty ? `(${it.qty}) ` : "";
+              replyText += `${idx + 1}. *${it.item}* ${qtyStr}— ${itPrice} [${it.category}]\n`;
+            });
+            replyText += `\n💰 *Total Keseluruhan:* ${formatGrandTotal}\n`;
+            replyText += `👤 *Pelapor:* ${senderName}`;
+          }
 
           await sock.sendMessage(msg.key.remoteJid, { text: replyText }, { quoted: msg });
         } else {
           if (imageBase64) {
             addLog("INFO", "Foto belum terdeteksi rincian biayanya");
-            const fallbackReply = `ℹ️ Foto struk/transfer diterima, namun rincian nominal belum terdeteksi.\n\nSilakan ketik rinciannya di grup ya (contoh: *beli semangka 50rb*).`;
+            const fallbackReply = `ℹ️ Foto struk/transfer diterima, namun rincian item/nominal belum terdeteksi otomatis.\n\nSilakan ketik rinciannya di grup ya (contoh:\n*Alpukat 0,740kg 16rb*\n*Mangga 0,850kg 10rb*).`;
             await sock.sendMessage(msg.key.remoteJid, { text: fallbackReply }, { quoted: msg });
           }
         }
@@ -412,29 +428,39 @@ async function parseExpenseWithAI(text, imageBase64, imageMime, apiKey) {
     if (text) {
       parts.push({ text: `Pesan chat pengeluaran: "${text}"` });
     } else {
-      parts.push({ text: "Analisis foto bukti transfer Shopee, struk belanja, atau nota pembelian ini. Baca nama barang/keperluan, jumlah qty jika ada (misal: 1kg 5pcs), dan TOTAL nominal rupiah yang dibayarkan (misal: Rp697.440)." });
+      parts.push({ text: "Analisis foto bukti transfer, struk nota belanja pasar/supermarket, atau screenshot pesanan Shopee/Tokopedia ini. Baca semua rincian barang yang dibeli (nama barang, qty, dan nominal rupiah masing-masing item)." });
     }
 
     const prompt = `Kamu adalah asisten keuangan untuk outlet makanan sehat bernama 'Hungreens' di Indonesia.
-Tugasmu: Analisis apakah pesan/foto ini merupakan laporan pengeluaran, nota belanja, atau bukti transfer operasional.
+Tugasmu: Analisis apakah pesan/foto ini merupakan laporan pengeluaran, nota belanja (pasar/toko), screenshot pesanan Shopee/Tokopedia, atau bukti transfer operasional.
+
 Aturan Kategori:
-- OPEX: Bahan baku makanan/minuman (buah, sayur, ayam, ikan, bumbu/saus, minyak, beras/rice paper, keju, chia seed) dan kemasan makanan (plastik kresek, lunch box, cup).
-- CAPEX: Kebutuhan operasional outlet non-makanan (listrik/token PLN, air/PDAM, gas elpiji, galon air, wifi/internet, sabun pel, pembersih dapur, tisu, cetak stiker, perlengkapan toko).
+- OPEX: Bahan baku makanan/minuman (buah, sayur, ayam, daging, ikan, bumbu/saus, minyak, beras, rice paper, keju, chia seed, susu) dan kemasan makanan (plastik kresek, lunch box, cup salad, tutup, paper bag, sedotan).
+- CAPEX: Kebutuhan operasional outlet non-makanan (listrik/token PLN, air/PDAM, gas elpiji, galon air minum, wifi/internet, sabun pel, pembersih dapur, tisu, cetak stiker logo, spanduk, perlengkapan toko/alat dapur).
 - Jika HANYA obrolan biasa, pertanyaan, sapaan, atau diskusi yang bukan biaya -> set isExpense: false.
+
+PENTING - CATAT PER ITEM TERPISAH:
+- Jika di nota/chat/screenshot Shopee terdapat beberapa barang berbeda (misalnya: Alpukat, Mangga, Anggur, Semangka), CATAT SETIAP BARANG SEBAGAI OBJEK TERPISAH dalam array "items". JANGAN DIGABUNG menjadi satu total.
+- Jika ada ongkos kirim atau biaya admin di Shopee, masukkan sebagai item tersendiri (misal: item "Ongkir Shopee", total: nominal ongkir).
+- Pastikan setiap nominal adalah angka murni rupiah tanpa titik atau koma (misal: 16000, 10000, 20000).
 
 Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown backtick):
 {
-  "isExpense": true atau false,
-  "category": "OPEX" atau "CAPEX",
-  "item": "nama barang / keperluan transfer",
-  "qty": "jumlah jika ada (contoh: 5 pcs, 5 kg, 2 pak)",
-  "total": angka murni nominal rupiah tanpa titik/koma (contoh: 697440),
-  "ket": "keterangan toko / supplier / nama penerima"
+  "isExpense": true,
+  "items": [
+    {
+      "category": "OPEX" atau "CAPEX",
+      "item": "nama barang",
+      "qty": "jumlah jika ada (contoh: 0,740 kg 3 pc, 2 kg, 1 pak)",
+      "total": 16000,
+      "ket": "keterangan toko / supplier (contoh: BB Buah, Shopee, Toko Plastik)"
+    }
+  ]
 }`;
 
     parts.unshift({ text: prompt });
 
-    // Model resmi Google Gemini Flash 2026
+    // Model resmi Google Gemini Flash
     const candidateModels = [
       "gemini-3.8-flash",
       "gemini-3.5-flash",
@@ -446,7 +472,6 @@ Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown back
       try {
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${mName}:generateContent?key=${apiKey}`;
         
-        // Panggil dengan toleransi retry jika ada spike permintaan sesaat (503)
         let res = null;
         let data = null;
         for (let attempt = 0; attempt < 2; attempt++) {
@@ -473,13 +498,27 @@ Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown back
           const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawText) {
             const parsed = cleanAndParseJSON(rawText);
-            if (parsed && typeof parsed.total === "number" && parsed.total > 0) {
-              addLog("AI SUCCESS", `Foto dibaca oleh [${mName}]: ${parsed.item} (Rp ${parsed.total.toLocaleString('id-ID')})`);
-              return parsed;
+            if (parsed && parsed.isExpense) {
+              let items = [];
+              if (Array.isArray(parsed.items) && parsed.items.length > 0) {
+                items = parsed.items.filter(it => it && typeof it.total === "number" && it.total > 0);
+              } else if (typeof parsed.total === "number" && parsed.total > 0) {
+                items = [{
+                  category: parsed.category || "OPEX",
+                  item: parsed.item || "Pengeluaran",
+                  qty: parsed.qty || "",
+                  total: parsed.total,
+                  ket: parsed.ket || ""
+                }];
+              }
+              if (items.length > 0) {
+                addLog("AI SUCCESS", `Berhasil dianalisis oleh [${mName}]: ${items.length} item terdeteksi`);
+                return { isExpense: true, items: items };
+              }
             }
           }
         } else {
-          addLog("AI RETRY", `Model ${mName} (${res.status}): ${data?.error?.message?.substring(0, 80) || "error"}`);
+          addLog("AI RETRY", `Model ${mName} (${res?.status}): ${data?.error?.message?.substring(0, 80) || "error"}`);
         }
       } catch (err) {
         addLog("AI RETRY", `Model ${mName} err: ${err.message}`);
@@ -491,71 +530,90 @@ Kembalikan format JSON persis seperti ini (hanya JSON murni, tanpa markdown back
   return parseExpenseFallback(text);
 }
 
-function parseExpenseFallback(text) {
-  if (!text) return { isExpense: false };
+function parseSingleLine(line) {
+  if (!line) return null;
+  const clean = line.trim();
+  if (clean.length < 3) return null;
 
-  // Abaikan pesan otomatis bot sendiri atau pesan instruksi
-  if (text.startsWith("✅") || text.startsWith("ℹ️") || text.startsWith("⚠️") || text.includes("*Tercatat ke [") || text.includes("contoh:")) {
-    return { isExpense: false };
-  }
-
-  const clean = text.trim();
-
-  // 1. Cari Nominal Harga:
-  // Prioritaskan Rp..., angka bertitik ribuan (contoh 697.440 atau 50.000), atau angka + rb/k/ribu (contoh 50rb, 100k)
-  // JANGAN cocokkan akhiran kg / koli / km / kaleng sebagai nominal
-  const priceMatch = clean.match(/(?:rp\.?\s*(\d{1,3}(?:[.,]\d{3})*|\d+)|\b(\d{1,3}(?:[.,]\d{3})+)\b|\b(\d+)\s*(rb|k|ribu)\b(?!\w))/i);
-  if (!priceMatch) return { isExpense: false };
+  // Cari nominal harga:
+  // 1) Rp / rp. 50.000 atau Rp50000
+  // 2) Angka bertitik ribuan: 50.000, 697.440
+  // 3) Angka + rb / k / ribu: 16ribu, 50rb, 28k
+  // 4) Angka murni 4-8 digit (1000 - 99999999): 12000, 25000
+  const priceRegex = /(?:rp\.?\s*(\d{1,3}(?:[.,]\d{3})*|\d+)|\b(\d{1,3}(?:[.,]\d{3})+)\b|\b(\d+)\s*(rb|k|ribu)\b(?!\w)|\b(\d{4,8})\b)/i;
+  const priceMatch = clean.match(priceRegex);
+  if (!priceMatch) return null;
 
   const fullPriceStr = priceMatch[0];
-  let rawNum = priceMatch[1] || priceMatch[2] || priceMatch[3];
+  let rawNum = priceMatch[1] || priceMatch[2] || priceMatch[3] || priceMatch[5];
   const unit = (priceMatch[4] || "").toLowerCase();
 
-  rawNum = rawNum.replace(/[.,]/g, "");
+  rawNum = (rawNum || "").replace(/[.,]/g, "");
   let total = parseInt(rawNum, 10);
   if (unit === "rb" || unit === "k" || unit === "ribu") {
     total *= 1000;
   }
 
-  if (total < 1000) return { isExpense: false };
+  if (isNaN(total) || total < 1000) return null;
 
-  // 2. Hapus string harga dari teks untuk mencari item dan qty
   let rem = clean.replace(fullPriceStr, "").trim();
 
-  // 3. Cari Quantity (contoh: 1kg, 5pcs, 2 pak, 1 dus, 3 btl, 1 sisir, dll)
-  const qtyRegex = /\b\d+(?:[.,]\d+)?\s*(?:kg|g|gram|ons|pcs|pc|pak|dus|btl|botol|ikat|iket|sisir|kaleng|butir|sak|roll|lembar)\b/gi;
+  // Cari Quantity (contoh: 0,740kg, 1kg, 5pcs, 2 pak, 3pc, 1 pc, 2L, 500gr)
+  const qtyRegex = /\b\d+(?:[.,]\d+)?\s*(?:kg|g|gram|ons|pcs|pc|pak|dus|btl|botol|ikat|iket|sisir|kaleng|butir|sak|roll|lembar|l|liter)\b/gi;
   const qtyMatches = rem.match(qtyRegex);
   const qtyStr = qtyMatches ? qtyMatches.join(" ") : "";
 
-  // 4. Sisanya adalah Item Barang
   let item = rem;
   if (qtyMatches) {
     for (const q of qtyMatches) {
-      item = item.replace(new RegExp(q, "gi"), "");
+      item = item.replace(q, "");
     }
   }
   item = item.replace(/\b(beli|bayar|tadi|untuk)\b/gi, "").replace(/^[,\s.-]+|[,\s.-]+$/g, "").trim();
   if (!item || item.length > 50) item = "Belanja Bahan";
 
-  const capexKeywords = ["gas", "elpiji", "galon", "token", "pln", "listrik", "air", "pdam", "wifi", "indosat", "sabun", "pel", "tisu", "stiker", "sarung tangan"];
+  const capexKeywords = ["gas", "elpiji", "galon", "token", "pln", "listrik", "air", "pdam", "wifi", "indosat", "sabun", "pel", "tisu", "stiker", "sarung tangan", "kresek"];
   const isCapex = capexKeywords.some(k => item.toLowerCase().includes(k));
 
   return {
-    isExpense: true,
     category: isCapex ? "CAPEX" : "OPEX",
-    item: item,
+    item: item.charAt(0).toUpperCase() + item.slice(1),
     qty: qtyStr,
     total: total,
     ket: ""
   };
 }
 
+function parseExpenseFallback(text) {
+  if (!text) return { isExpense: false, items: [] };
+
+  if (text.startsWith("✅") || text.startsWith("ℹ️") || text.startsWith("⚠️") || text.includes("*Tercatat ke [") || text.includes("contoh:")) {
+    return { isExpense: false, items: [] };
+  }
+
+  // Pisahkan baris baru atau koma pemisah item (hindari memecah koma desimal seperti 0,740kg)
+  const lines = text.split(/(?:\r?\n|,(?!\d))/).map(s => s.trim()).filter(Boolean);
+  const items = [];
+
+  for (const line of lines) {
+    const parsed = parseSingleLine(line);
+    if (parsed) items.push(parsed);
+  }
+
+  if (items.length === 0) return { isExpense: false, items: [] };
+
+  return {
+    isExpense: true,
+    items: items
+  };
+}
+
 function getWeekTabName(dateNum) {
-  if (dateNum >= 1 && dateNum <= 7) return "Minggu 1";
-  if (dateNum >= 8 && dateNum <= 14) return "Minggu 2";
-  if (dateNum >= 15 && dateNum <= 21) return "Minggu 3";
-  if (dateNum >= 22 && dateNum <= 28) return "Minggu 4";
-  return "Minggu 5";
+  if (dateNum >= 1 && dateNum <= 7) return "MINGGU 1";
+  if (dateNum >= 8 && dateNum <= 14) return "MINGGU 2";
+  if (dateNum >= 15 && dateNum <= 21) return "MINGGU 3";
+  if (dateNum >= 22 && dateNum <= 28) return "MINGGU 4";
+  return "MINGGU 5";
 }
 
 startWhatsAppBot();

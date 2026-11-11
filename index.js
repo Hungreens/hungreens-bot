@@ -6,6 +6,7 @@ import makeWASocket, {
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
+import { rmSync, existsSync } from "fs";
 
 // ===================================================================
 // KONFIGURASI BOT HUNGREENS CLOUD 24 JAM (ABSENSI & PENGELUARAN)
@@ -131,6 +132,22 @@ app.get("/qr", (req, res) => {
 
 app.get("/ping", (req, res) => res.send("PONG - Bot Awake!"));
 
+app.get("/reset", async (req, res) => {
+  try {
+    addLog("RESET", "⚠️ Manual session reset dipicu via /reset endpoint");
+    if (existsSync("auth_session")) {
+      rmSync("auth_session", { recursive: true, force: true });
+      addLog("RESET", "🗑️ Folder auth_session berhasil dihapus");
+    }
+    res.send("✅ Session reset berhasil! Silakan buka /qr untuk scan QR Code baru. Bot akan restart otomatis.");
+    // Restart bot untuk generate QR baru
+    setTimeout(() => startWhatsAppBot(), 1000);
+  } catch (err) {
+    addLog("RESET ERROR", err.message);
+    res.status(500).send("❌ Gagal reset: " + err.message);
+  }
+});
+
 app.get("/logs", (req, res) => {
   res.json({
     isConnected,
@@ -225,9 +242,26 @@ async function startWhatsAppBot() {
       isConnected = false;
       currentQRDataURL = null;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      addLog("KONEKSI", `Koneksi terputus (status: ${statusCode}). Reconnecting: ${shouldReconnect}`);
-      if (shouldReconnect) startWhatsAppBot();
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+      addLog("KONEKSI", `Koneksi terputus (status: ${statusCode}). LoggedOut: ${isLoggedOut}`);
+      
+      if (isLoggedOut) {
+        // Session expired/logout dari WA — hapus auth lama & generate QR baru
+        addLog("KONEKSI", "🔄 Session expired. Menghapus auth lama & memulai ulang dengan QR baru...");
+        try {
+          if (existsSync("auth_session")) {
+            rmSync("auth_session", { recursive: true, force: true });
+            addLog("KONEKSI", "🗑️ auth_session lama berhasil dihapus");
+          }
+        } catch (e) {
+          addLog("KONEKSI ERROR", `Gagal hapus auth_session: ${e.message}`);
+        }
+        // Restart untuk generate QR baru
+        setTimeout(() => startWhatsAppBot(), 2000);
+      } else {
+        // Koneksi terputus biasa (sinyal, timeout) — reconnect dengan session yang sama
+        startWhatsAppBot();
+      }
     } else if (connection === "open") {
       isConnected = true;
       currentQRDataURL = null;

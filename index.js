@@ -24,14 +24,47 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const PORT = process.env.PORT || 3000;
 
 const EMPLOYEE_MAP = {
+  // Nomor HP resmi
   "6285819727906": "IFA",
   "6285708752712": "ISNA",
   "6285746582094": "AMEL",
   "6288805150800": "CINTA",
   "6287850296928": "NEGA",
   "628888397518":  "RISNA",
-  "6285536859369": "VISKA"
+  "6285536859369": "VISKA",
+
+  // WhatsApp LID (Linked Identity jika nomor HP disamarkan oleh WhatsApp)
+  "237189652824291": "CINTA"
 };
+
+// Pemetaan Nama / Username WA (Case-Insensitive) agar nama di spreadsheet selalu sesuai
+const USERNAME_MAP = {
+  "crsqply": "CINTA",
+  "cinta": "CINTA",
+  "riss": "RISNA",
+  "risna": "RISNA",
+  "vis": "VISKA",
+  "viska": "VISKA",
+  "isnaa": "ISNA",
+  "isna": "ISNA",
+  "amel": "AMEL",
+  "amelia": "AMEL",
+  "nega": "NEGA",
+  "ifa": "IFA"
+};
+
+function resolveEmployeeName(phone, pushName) {
+  if (phone && EMPLOYEE_MAP[phone]) return EMPLOYEE_MAP[phone];
+  if (pushName) {
+    const cleanLower = pushName.trim().toLowerCase();
+    for (const [key, standardName] of Object.entries(USERNAME_MAP)) {
+      if (cleanLower === key || cleanLower.includes(key)) {
+        return standardName;
+      }
+    }
+  }
+  return pushName || "Karyawan";
+}
 
 // Penyimpanan Log Aktivitas (Maksimal 30 pesan terakhir untuk live monitoring)
 const activityLogs = [];
@@ -309,7 +342,7 @@ async function startWhatsAppBot() {
       const senderJid = msg.key.participant || msg.key.remoteJid;
       const cleanPhone = senderJid.replace(/@.+/, "").replace(/\D/g, "");
       const pushName = msg.pushName || (msg.key.fromMe ? "Owner (Dimmy)" : "Karyawan");
-      const senderName = EMPLOYEE_MAP[cleanPhone] || pushName;
+      const senderName = msg.key.fromMe ? "Owner (Dimmy)" : resolveEmployeeName(cleanPhone, pushName);
 
       // Cek tipe pesan
       const isLocation = !!(content.locationMessage || content.liveLocationMessage);
